@@ -25,11 +25,14 @@ classifiers = [
 ]
 dependencies = [
   "requests>=2.28.0",
+  "PySocks>=1.7.1",
   "tqdm>=4.65.0",
 ]
 
 [project.scripts]
+# Short name for day-to-day use; pipx-friendly long name avoids PATH clashes with other "drift" tools.
 drift = "driftpkg.cli:main"
+drift-registry-dumper = "driftpkg.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

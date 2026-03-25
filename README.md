@@ -29,6 +29,36 @@ After installation, the console script **`drift`** is on your `PATH`. You can al
 python -m driftpkg --help
 ```
 
+### Install with pipx
+
+The project is a normal **PEP 517** app with **`[project.scripts]`** entry points, so **pipx** can install it into an isolated venv and link the executables onto your `PATH`.
+
+From a clone (replace with your path or use `.` from the repo root):
+
+```bash
+pipx install /path/to/drift
+```
+
+After publishing to PyPI (or with a VCS URL):
+
+```bash
+pipx install drift-registry-dumper
+# or, e.g.:
+# pipx install git+https://github.com/you/drift.git
+```
+
+pipx exposes two equivalent commands (use the long name if another `drift` is already on your `PATH`):
+
+- `drift`
+- `drift-registry-dumper` (same as `drift`, name matches the distribution on PyPI)
+
+Upgrade / uninstall:
+
+```bash
+pipx upgrade drift-registry-dumper
+pipx uninstall drift-registry-dumper
+```
+
 ## Usage
 
 Minimal example (TLS verify on, output under `./dump`):
@@ -112,7 +142,7 @@ Sizes accept plain bytes (`5242880`) or suffixes: **`K`**, **`M`**, **`G`**, **`
 |------|-------|---------|---------|
 | `--registry` | `-r` | *(required)* | Registry base URL (trailing `/` stripped). |
 | `--output` | `-o` | `dump` | Root directory for all dumped images. |
-| `--proxy` | `-p` | *(none)* | HTTP(S) proxy for `requests`. |
+| `--proxy` | `-p` | *(none)* | Proxy URL for `requests` (`http://`, `https://`, or **`socks5[h]://`** — `PySocks` is bundled so SOCKS does not need an extra install). |
 | `--insecure` | `-k` | off | Skip TLS certificate verification. |
 | `--user-agent` | `-u` | `registry-dumper/3.0` | `User-Agent` header on registry calls. |
 
