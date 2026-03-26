@@ -39,12 +39,10 @@ From a clone (replace with your path or use `.` from the repo root):
 pipx install /path/to/drift
 ```
 
-After publishing to PyPI (or with a VCS URL):
+Or directly from GitHub:
 
 ```bash
-pipx install drift
-# or, e.g.:
-# pipx install git+https://github.com/amagnosi-so/drift.git
+pipx install git+https://github.com/amagnosi-so/drift.git
 ```
 
 pipx links the **`drift`** command on your `PATH`.
