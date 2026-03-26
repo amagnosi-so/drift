@@ -6,6 +6,7 @@ import os
 from driftpkg.config import DriftConfig
 from driftpkg.downloader import BlobDownloader
 from driftpkg.extract import extract_layer
+from driftpkg.plan import TagPlan, build_tag_plan, print_plans
 from driftpkg.rebuild import build_docker_image
 from driftpkg.registry import RegistryClient
 from driftpkg.utils import mkdir
@@ -14,6 +15,7 @@ from driftpkg.utils import mkdir
 class DriftApp:
     def __init__(self, config: DriftConfig, session):
         self._cfg = config
+        self._session = session
         self._registry = RegistryClient(config.registry, session)
         self._downloader = BlobDownloader(config, session)
 
@@ -26,7 +28,8 @@ class DriftApp:
             json.dump(data, f, indent=2)
         return config_path
 
-    def process_image(self, repo: str, tag: str) -> None:
+    def execute_tag_plan(self, plan: TagPlan) -> None:
+        repo, tag, manifest = plan.repo, plan.tag, plan.manifest
         print(f"\n=== {repo}:{tag} ===")
 
         base = os.path.join(self._cfg.output, repo, tag)
@@ -39,7 +42,6 @@ class DriftApp:
         mkdir(fs)
         mkdir(marker)
 
-        manifest = self._registry.get_manifest(repo, tag)
         with open(os.path.join(base, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
 
@@ -58,10 +60,81 @@ class DriftApp:
             name = f"{self._cfg.image_prefix}/{repo}:{tag}".lower()
             build_docker_image(fs, config_path, name)
 
+    def _repo_tag_pairs(self) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        repos = self._catalog_repos()
+        print("[+] Repositories to process:", repos if repos else "(none)")
+        for repo in repos:
+            tags = self._tags_for_repo(repo)
+            if not tags:
+                print(f"[!] No matching tags for {repo!r}; skip")
+                continue
+            for tag in tags:
+                pairs.append((repo, tag))
+        return pairs
+
+    def _confirm_plan(self) -> bool:
+        if self._cfg.assume_yes:
+            return True
+        try:
+            line = input("\nProceed with download and extraction? [y/N]: ").strip().lower()
+        except EOFError:
+            return False
+        return line in ("y", "yes")
+
+    def _catalog_repos(self) -> list[str]:
+        repos = self._registry.get_catalog()
+        rf = self._cfg.repo_filter
+        if rf is None:
+            return list(repos)
+        if not rf:
+            return []
+        out = [r for r in repos if r in rf]
+        missing = rf.difference(frozenset(repos))
+        for name in sorted(missing):
+            print(f"[!] Repository not in catalog (skipped): {name}")
+        return out
+
+    def _tags_for_repo(self, repo: str) -> list[str]:
+        tags = self._registry.get_tags(repo)
+        tf = self._cfg.tag_filter
+        if tf is None:
+            return tags
+        if not tf:
+            return []
+        return [t for t in tags if t in tf]
+
+    def _build_plans(self, pairs: list[tuple[str, str]]) -> list[TagPlan]:
+        plans: list[TagPlan] = []
+        for repo, tag in pairs:
+            manifest = self._registry.get_manifest(repo, tag)
+            plans.append(
+                build_tag_plan(
+                    self._session,
+                    self._cfg.registry,
+                    repo,
+                    tag,
+                    manifest,
+                    self._cfg.chunk_size,
+                    self._cfg.blob_timeout,
+                )
+            )
+        return plans
+
     def run(self) -> None:
         mkdir(self._cfg.output)
-        repos = self._registry.get_catalog()
-        print("[+] Repos:", repos)
-        for repo in repos:
-            for tag in self._registry.get_tags(repo):
-                self.process_image(repo, tag)
+        pairs = self._repo_tag_pairs()
+        if not pairs:
+            print("[!] Nothing to do (no repository/tag pairs).")
+            return
+
+        print("\n[+] Building download plan (manifest + HEAD each blob)…")
+        plans = self._build_plans(pairs)
+        print_plans(plans, self._cfg.chunk_size)
+
+        if not self._confirm_plan():
+            print("Aborted (no downloads started).")
+            return
+
+        for plan in plans:
+            self.execute_tag_plan(plan)

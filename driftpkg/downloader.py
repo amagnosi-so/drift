@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from driftpkg.config import DriftConfig
 from driftpkg.controller import AdaptiveController
+from driftpkg.registry_paths import encode_repo
 from driftpkg.utils import hash_file, mkdir, safe_digest, verify_blob
 
 
@@ -31,6 +32,19 @@ class BlobDownloader:
         )
         self._progress_lock = threading.Lock()
         self._global_progress: tqdm | None = None
+
+    def _digest_short(self, digest: str) -> str:
+        return digest.split(":")[-1][:12] if ":" in digest else digest[:12]
+
+    def _refresh_global_postfix(
+        self, digest: str, num_parts: int, n_completed: int
+    ) -> None:
+        with self._progress_lock:
+            bar = self._global_progress
+            if bar is None:
+                return
+            bar.set_description(f"blob:{self._digest_short(digest)}", refresh=False)
+            bar.set_postfix_str(f"parts {n_completed}/{num_parts}", refresh=True)
 
     def _jitter(self, min_ms: float, max_ms: float) -> None:
         if not self._cfg.jitter_enabled:
@@ -68,21 +82,24 @@ class BlobDownloader:
         end: int,
         out_path: str,
         idx: int,
+        num_parts: int,
     ) -> bool:
         total_chunk_size = end - start + 1
         current = start
         chunk_sz = self._cfg.chunk_size
+        part_label = f"part {idx + 1}/{max(num_parts, 1)}"
 
         for attempt in range(self._cfg.chunk_retries):
             try:
                 start_time = time.time()
                 written = 0
+                sub_requests = 0
 
                 with open(out_path, "wb") as f, tqdm(
                     total=total_chunk_size,
                     unit="B",
                     unit_scale=True,
-                    desc=f"chunk-{idx}",
+                    desc=part_label,
                     position=idx % 10 + 1,
                     leave=False,
                 ) as pbar:
@@ -95,6 +112,8 @@ class BlobDownloader:
                             self._read_limit_for_subrequest(request_size), request_size
                         )
                         bytes_read = 0
+                        sub_requests += 1
+                        pbar.set_postfix(sub=sub_requests, refresh=False)
 
                         try:
                             with self._session.get(
@@ -182,19 +201,8 @@ class BlobDownloader:
         head.raise_for_status()
         total_size = int(head.headers.get("Content-Length", 0))
 
-        with self._progress_lock:
-            if self._global_progress is None:
-                self._global_progress = tqdm(
-                    total=total_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc="TOTAL",
-                    position=0,
-                    leave=True,
-                )
-
         num_parts = math.ceil(total_size / chunk_sz) if total_size else 0
-        print(f"[+] Adaptive download {digest} ({num_parts} parts)")
+        print(f"[+] Adaptive download {digest} ({num_parts} parallel parts)")
 
         completed: set[int] = set()
         if os.path.exists(meta_path):
@@ -208,6 +216,21 @@ class BlobDownloader:
             except Exception:
                 print("[!] Corrupted metadata → ignoring")
 
+        with self._progress_lock:
+            if self._global_progress is not None:
+                self._global_progress.close()
+            self._global_progress = tqdm(
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                desc=f"blob:{self._digest_short(digest)}",
+                position=0,
+                leave=True,
+            )
+            self._global_progress.set_postfix_str(
+                f"parts {len(completed)}/{num_parts}", refresh=False
+            )
+
         downloaded_bytes = 0
         for i in completed:
             start = i * chunk_sz
@@ -216,6 +239,7 @@ class BlobDownloader:
 
         if self._global_progress:
             self._global_progress.update(downloaded_bytes)
+        self._refresh_global_postfix(digest, num_parts, len(completed))
 
         lock = threading.Lock()
         indices = list(range(num_parts))
@@ -227,7 +251,7 @@ class BlobDownloader:
             start = i * chunk_sz
             end = min(start + chunk_sz - 1, total_size - 1)
             part_path = os.path.join(parts_dir, f"part_{i}")
-            success = self.download_range(url, start, end, part_path, i)
+            success = self.download_range(url, start, end, part_path, i, num_parts)
             if success:
                 if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
                     print(f"[!] Invalid part_{i}")
@@ -239,6 +263,7 @@ class BlobDownloader:
                     completed.add(i)
                     with open(meta_path, "w") as f:
                         json.dump({"completed": list(completed)}, f)
+                    self._refresh_global_postfix(digest, num_parts, len(completed))
 
             progress = len(completed) / num_parts if num_parts else 1.0
             if progress > 0.8:
@@ -252,8 +277,8 @@ class BlobDownloader:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 executor.map(worker, indices)
             print(
-                f"[i] Progress: {len(completed)}/{num_parts} | workers={workers} "
-                f"rate={self._controller.get_rate() / 1024 / 1024:.2f}MB/s"
+                f"[i] Parts done: {len(completed)}/{num_parts} | workers={workers} | "
+                f"throttle={self._controller.get_rate() / 1024 / 1024:.2f}MiB/s"
             )
             self._jitter(
                 self._cfg.jitter_pool_loop_min_ms,
@@ -298,7 +323,8 @@ class BlobDownloader:
     def download_blob(self, repo: str, digest: str, archive_dir: str) -> str:
         filename = safe_digest(digest)
         path = os.path.join(archive_dir, filename)
-        url = f"{self._cfg.registry}/v2/{repo}/blobs/{digest}"
+        path_repo = encode_repo(repo)
+        url = f"{self._cfg.registry}/v2/{path_repo}/blobs/{digest}"
 
         for attempt in range(self._cfg.blob_max_retries):
             try:

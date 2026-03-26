@@ -1,6 +1,9 @@
 # JetBrains
 .idea/
 
+# Output
+dump
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

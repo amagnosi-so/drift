@@ -36,6 +36,26 @@ def parse_positive_float(value: str) -> float:
     return x
 
 
+def parse_name_filter(items: list[str] | None) -> frozenset[str] | None:
+    """None => no filter (all names). frozenset => only those names. Commas allowed in each value."""
+    if not items:
+        return None
+    parts: list[str] = []
+    for raw in items:
+        for piece in raw.split(","):
+            piece = piece.strip()
+            if piece:
+                parts.append(piece)
+    if not parts:
+        return None
+    lowered = {p.lower() for p in parts}
+    if "all" in lowered or "*" in lowered:
+        if len(parts) > 1:
+            raise SystemExit("cannot mix 'all' or '*' with other names in one --repo/--tag list")
+        return None
+    return frozenset(parts)
+
+
 @dataclass(frozen=True)
 class DriftConfig:
     registry: str
@@ -73,6 +93,9 @@ class DriftConfig:
     jitter_pool_loop_max_ms: float
     micro_backoff_min_s: float
     micro_backoff_max_s: float
+    repo_filter: frozenset[str] | None
+    tag_filter: frozenset[str] | None
+    assume_yes: bool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable TLS certificate verification",
     )
     p.add_argument(
+        "-y",
+        "--yes",
+        dest="assume_yes",
+        action="store_true",
+        help="Skip the pre-download plan confirmation prompt (proceed immediately)",
+    )
+    p.add_argument(
         "-b",
         "--rebuild",
         action="store_true",
@@ -116,6 +146,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify-diffid",
         action="store_true",
         help="Verify uncompressed layer hashes (reserved / future use)",
+    )
+    p.add_argument(
+        "-S",
+        "--repo",
+        "--image",
+        action="append",
+        dest="repos",
+        metavar="NAME",
+        help=(
+            "Repository to dump (repeat or comma-separated). "
+            "Use 'all' / '*' for every repository without a prompt. "
+            "If omitted, you are prompted once (before the plan) to choose repos from the catalog. "
+            "Alias: --image (there is no short -i: it is used for jitter)."
+        ),
+    )
+    p.add_argument(
+        "-G",
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help=(
+            "Tag to dump (repeat or comma-separated). "
+            "Omit, or use 'all' / '*' for every tag."
+        ),
+    )
+    p.add_argument(
+        "-x",
+        "--interactive",
+        action="store_true",
+        help=(
+            "After listing the catalog, prompt to choose repos and tags "
+            "(only for choices not already set via --repo / --tag)."
+        ),
     )
 
     frag = p.add_mutually_exclusive_group()
@@ -257,8 +321,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-L", "--jitter-inner-near-max-ms", type=float, default=800.0)
     p.add_argument("-v", "--jitter-worker-near-min-ms", type=float, default=300.0)
     p.add_argument("-X", "--jitter-worker-near-max-ms", type=float, default=1200.0)
-    p.add_argument("-y", "--jitter-pool-loop-min-ms", type=float, default=200.0)
-    p.add_argument("-Y", "--jitter-pool-loop-max-ms", type=float, default=800.0)
+    p.add_argument("-z", "--jitter-pool-loop-min-ms", type=float, default=200.0)
+    p.add_argument("-Z", "--jitter-pool-loop-max-ms", type=float, default=800.0)
     p.add_argument("-A", "--micro-backoff-min-s", type=float, default=1.0)
     p.add_argument("-C", "--micro-backoff-max-s", type=float, default=3.0)
 
@@ -313,6 +377,9 @@ def config_from_args(ns: argparse.Namespace) -> DriftConfig:
         jitter_pool_loop_max_ms=ns.jitter_pool_loop_max_ms,
         micro_backoff_min_s=ns.micro_backoff_min_s,
         micro_backoff_max_s=ns.micro_backoff_max_s,
+        repo_filter=parse_name_filter(ns.repos),
+        tag_filter=parse_name_filter(ns.tags),
+        assume_yes=ns.assume_yes,
     )
 
 

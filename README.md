@@ -67,10 +67,52 @@ Minimal example (TLS verify on, output under `./dump`):
 drift -r https://registry.example.com
 ```
 
+### Choosing repositories and tags
+
+**Repositories**
+
+- If you **omit** **`--repo` / `-S`**, the tool fetches `_catalog` and **prompts you once** (before the download plan) to pick repositories—same UI as below: numbers, names, or **`all`** / **`*`** / Enter for every repo.
+- To process the whole catalog **without** that prompt, pass **`--repo all`** or **`-S '*'`** explicitly (automation-friendly).
+- Otherwise **`--repo` / `-S`** (alias **`--image`**) filters to one or more names (repeat or comma-separated).
+
+**Repository names with `/`**
+
+Paths under **`/v2/<name>/...`** encode the name so slashes are **`%2F`** (e.g. `akeyless/gateway` → `akeyless%2Fgateway`). Otherwise the registry treats extra path segments and requests **404**.
+
+**Tags**
+
+- **`--tag` / `-G`** filters tags (repeat, comma-separated, or **`all`** / **`*`**).
+- If you omit **`--tag`** and pass **`--interactive` / `-x`**, you get a **tag** picker after the repo step (union of tags across selected repos).
+- Omitting **`--tag`** without **`-x`** means **all tags** for each selected repository.
+
+Examples:
+
+```bash
+# No -S: prompted for repos; then all tags for those repos
+drift -r https://registry.example
+
+# All repos, no repo prompt; all tags
+drift -r https://registry.example -S all
+
+# Non-interactive: these repos, all tags
+drift -r https://registry.example -S my/app -S other/service
+
+# Interactive tags only (repos already set on CLI)
+drift -r https://registry.example -S my/app -x
+```
+
+**Note:** **`-i`** is used for **`--jitter-inline-min-ms`**; use **`-S`** / **`--image`** for repository selection.
+
+### Pre-download plan and confirmation
+
+Before any blob is fetched, the tool builds a **plan** for every selected `repo:tag`: it reads each **manifest**, then **`HEAD`s each blob** (config + layers) for `Content-Length`. It prints a **table** with digest, type (config/layer), size, and **parallel part count** per layer (`ceil(size / chunk-size)`). The summary includes a **naive total** across tags and a **unique-digest total** (helpful when several tags share layers—the second tag often skips real network I/O if the blob file already exists and verifies).
+
+By default it then asks: **`Proceed with download and extraction? [y/N]`**. Pass **`--yes` / `-y`** to skip that prompt (for automation or piped runs). The jitter tuning flags **`--jitter-pool-loop-min-ms` / `-z`** and **`--jitter-pool-loop-max-ms` / `-Z`** are used so **`-y` stays reserved for “yes, proceed”.**
+
 ## What the tool does
 
-1. **Lists repositories** via `GET /v2/_catalog`, then **tags** per repo via `GET /v2/{name}/tags/list`.
-2. For each `repo:tag`, fetches the **manifest** (`application/vnd.docker.distribution.manifest.v2+json`).
+1. **Lists repositories** via `GET /v2/_catalog`, then **tags** per repo via `GET /v2/<encoded-name>/tags/list` (names with `/` are percent-encoded, e.g. `%2F`).
+2. For each `repo:tag`, fetches the **manifest** with `Accept` covering **Docker v2** and **OCI** image manifests (and list/index types), so registries that only store OCI manifests still return **200** instead of a misleading **404**.
 3. **Downloads the config blob** (image JSON) with a **single streaming** HTTP GET (resume supported via `Range` if a `.part` file exists).
 4. **Downloads each layer blob** using a **parallel, ranged** strategy: the blob is split into fixed-size parts; each part is written by one worker using many smaller HTTP sub-requests with `Range: bytes=...` headers until the part’s byte range is complete.
 5. **Verifies** each layer part and the merged blob against the registry digest (SHA-256).
@@ -126,7 +168,7 @@ Where it applies (parallel layer path unless `-J`):
 | After each successful sub-request | `-d`, `-E` | Pause before the next `Range` request in the same part |
 | When a part is >80% complete (inner loop) | `-l`, `-L` | Extra delay near the end of a part |
 | When overall part completion >80% (worker) | `-v`, `-X` | Delay after finishing work in a loaded phase |
-| Between outer pool passes while parts remain | `-y`, `-Y` | Pause before re-submitting work to the executor |
+| Between outer pool passes while parts remain | `-z`, `-Z` | Pause before re-submitting work to the executor |
 
 On **sub-request failure** (before retrying that sub-range), the tool sleeps a random duration between **`--micro-backoff-min-s` / `-A`** and **`--micro-backoff-max-s` / `-C`**.
 
@@ -143,8 +185,17 @@ Sizes accept plain bytes (`5242880`) or suffixes: **`K`**, **`M`**, **`G`**, **`
 | `--registry` | `-r` | *(required)* | Registry base URL (trailing `/` stripped). |
 | `--output` | `-o` | `dump` | Root directory for all dumped images. |
 | `--proxy` | `-p` | *(none)* | Proxy URL for `requests` (`http://`, `https://`, or **`socks5[h]://`** — `PySocks` is bundled so SOCKS does not need an extra install). |
-| `--insecure` | `-k` | off | Skip TLS certificate verification. |
+| `--insecure` | `-k` | off | Skip TLS certificate verification (urllib3 “Unverified HTTPS request” warnings are disabled for this mode). |
 | `--user-agent` | `-u` | `registry-dumper/3.0` | `User-Agent` header on registry calls. |
+
+### Scope (which repos / tags)
+
+| Long | Short | Default | Purpose |
+|------|-------|---------|---------|
+| `--repo` / `--image` | `-S` | *(prompt)* | Omit: prompted once before the plan from `_catalog`. Or pass repo names, or `all` / `*` alone for every repo with no prompt. |
+| `--tag` | `-G` | *(all)* | Limit to these tags (repeat or comma-separated). Use `all` or `*` alone for every tag. |
+| `--interactive` | `-x` | off | Prompt on stdin to pick repos and/or tags after listing the catalog (skips prompts for axes already set via `-S` / `-G`, including `all`). |
+| `--yes` | `-y` | off | After the plan table, do not ask for confirmation; start downloads immediately. |
 
 ### Rebuild and verification
 
@@ -208,8 +259,8 @@ Sizes accept plain bytes (`5242880`) or suffixes: **`K`**, **`M`**, **`G`**, **`
 | `--jitter-inner-near-max-ms` | `-L` | `800` | Same (ms). |
 | `--jitter-worker-near-min-ms` | `-v` | `300` | When many parts done (worker, ms). |
 | `--jitter-worker-near-max-ms` | `-X` | `1200` | Same (ms). |
-| `--jitter-pool-loop-min-ms` | `-y` | `200` | Between executor passes (ms). |
-| `--jitter-pool-loop-max-ms` | `-Y` | `800` | Between executor passes (ms). |
+| `--jitter-pool-loop-min-ms` | `-z` | `200` | Between executor passes (ms). |
+| `--jitter-pool-loop-max-ms` | `-Z` | `800` | Between executor passes (ms). |
 | `--micro-backoff-min-s` | `-A` | `1` | Sub-request error backoff (seconds). |
 | `--micro-backoff-max-s` | `-C` | `3` | Sub-request error backoff (seconds). |
 
