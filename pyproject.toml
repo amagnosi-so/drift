@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drift-registry-dumper"
+name = "drift"
 version = "3.0.0"
 description = "Docker registry dumper and filesystem rebuilder with configurable parallel ranged downloads"
 readme = "README.md"
@@ -30,9 +30,7 @@ dependencies = [
 ]
 
 [project.scripts]
-# Short name for day-to-day use; pipx-friendly long name avoids PATH clashes with other "drift" tools.
 drift = "driftpkg.cli:main"
-drift-registry-dumper = "driftpkg.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

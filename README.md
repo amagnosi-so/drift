@@ -42,22 +42,21 @@ pipx install /path/to/drift
 After publishing to PyPI (or with a VCS URL):
 
 ```bash
-pipx install drift-registry-dumper
+pipx install drift
 # or, e.g.:
-# pipx install git+https://github.com/you/drift.git
+# pipx install git+https://github.com/amagnosi-so/drift.git
 ```
 
-pipx exposes two equivalent commands (use the long name if another `drift` is already on your `PATH`):
-
-- `drift`
-- `drift-registry-dumper` (same as `drift`, name matches the distribution on PyPI)
+pipx links the **`drift`** command on your `PATH`.
 
 Upgrade / uninstall:
 
 ```bash
-pipx upgrade drift-registry-dumper
-pipx uninstall drift-registry-dumper
+pipx upgrade drift
+pipx uninstall drift
 ```
+
+If you previously installed under the old name, run `pipx uninstall drift-registry-dumper` once, then `pipx install drift` (or install from a path / git URL as above).
 
 ## Usage
 
