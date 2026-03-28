@@ -31,16 +31,6 @@ python -m driftpkg --help
 
 ### Install with pipx
 
-The project is a normal **PEP 517** app with **`[project.scripts]`** entry points, so **pipx** can install it into an isolated venv and link the executables onto your `PATH`.
-
-From a clone (replace with your path or use `.` from the repo root):
-
-```bash
-pipx install /path/to/drift
-```
-
-Or directly from GitHub:
-
 ```bash
 pipx install git+https://github.com/amagnosi-so/drift.git
 ```
@@ -53,8 +43,6 @@ Upgrade / uninstall:
 pipx upgrade drift
 pipx uninstall drift
 ```
-
-If you previously installed under the old name, run `pipx uninstall drift-registry-dumper` once, then `pipx install drift` (or install from a path / git URL as above).
 
 ## Usage
 
