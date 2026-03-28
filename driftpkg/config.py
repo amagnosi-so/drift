@@ -96,6 +96,9 @@ class DriftConfig:
     repo_filter: frozenset[str] | None
     tag_filter: frozenset[str] | None
     assume_yes: bool
+    subrange_recover: str
+    digest_mismatch_recover: str
+    digest_mismatch_max_rounds: int
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,6 +329,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-A", "--micro-backoff-min-s", type=float, default=1.0)
     p.add_argument("-C", "--micro-backoff-max-s", type=float, default=3.0)
 
+    p.add_argument(
+        "--subrange-recover",
+        choices=("truncate", "restart-part"),
+        default="truncate",
+        help=(
+            "After a failed ranged read (e.g. SSL): truncate the part file to the last good offset "
+            "and retry (truncate), or discard the whole part file and retry from scratch (restart-part)."
+        ),
+    )
+    p.add_argument(
+        "--digest-mismatch",
+        choices=("full", "retry-problematic"),
+        default="retry-problematic",
+        metavar="MODE",
+        help=(
+            "If the merged blob fails SHA-256 verify: delete all parts and restart (full), or "
+            "re-download only parts that had subrange errors, or all parts if none were flagged "
+            "(retry-problematic). See also --digest-mismatch-rounds."
+        ),
+    )
+    p.add_argument(
+        "--digest-mismatch-rounds",
+        type=int,
+        default=5,
+        help=(
+            "With --digest-mismatch retry-problematic: max verify/re-merge rounds before a full "
+            "part-tree reset (0 = immediate full reset on first bad digest)."
+        ),
+    )
+
     return p
 
 
@@ -340,6 +373,8 @@ def config_from_args(ns: argparse.Namespace) -> DriftConfig:
         raise SystemExit("--chunk-retries must be >= 1")
     if ns.max_workers < ns.base_workers:
         raise SystemExit("--max-workers must be >= --base-workers")
+    if ns.digest_mismatch_rounds < 0:
+        raise SystemExit("--digest-mismatch-rounds must be >= 0")
 
     return DriftConfig(
         registry=ns.registry.rstrip("/"),
@@ -380,6 +415,9 @@ def config_from_args(ns: argparse.Namespace) -> DriftConfig:
         repo_filter=parse_name_filter(ns.repos),
         tag_filter=parse_name_filter(ns.tags),
         assume_yes=ns.assume_yes,
+        subrange_recover=ns.subrange_recover,
+        digest_mismatch_recover=ns.digest_mismatch,
+        digest_mismatch_max_rounds=ns.digest_mismatch_rounds,
     )
 
 

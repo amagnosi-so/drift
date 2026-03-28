@@ -7,6 +7,7 @@ import random
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -15,7 +16,7 @@ from tqdm import tqdm
 from driftpkg.config import DriftConfig
 from driftpkg.controller import AdaptiveController
 from driftpkg.registry_paths import encode_repo
-from driftpkg.utils import hash_file, mkdir, safe_digest, verify_blob
+from driftpkg.utils import mkdir, safe_digest, verify_blob
 
 
 class BlobDownloader:
@@ -83,13 +84,15 @@ class BlobDownloader:
         out_path: str,
         idx: int,
         num_parts: int,
+        on_subrange_error: Callable[[], None] | None = None,
     ) -> bool:
         total_chunk_size = end - start + 1
-        current = start
         chunk_sz = self._cfg.chunk_size
         part_label = f"part {idx + 1}/{max(num_parts, 1)}"
 
         for attempt in range(self._cfg.chunk_retries):
+            current = start
+            restart_whole_part = False
             try:
                 start_time = time.time()
                 written = 0
@@ -145,7 +148,14 @@ class BlobDownloader:
                                     self._maybe_inline_jitter()
 
                         except Exception as e:
-                            print(f"[!] Subrange error chunk-{idx}: {e}")
+                            if on_subrange_error:
+                                on_subrange_error()
+                            rec = self._cfg.subrange_recover
+                            print(
+                                f"[!] Subrange error part {idx} (blob offset {current}, "
+                                f"{written}/{total_chunk_size} B in this part): {e} "
+                                f"[subrange recover: {rec}]"
+                            )
                             self._controller.record_error()
                             time.sleep(
                                 random.uniform(
@@ -153,6 +163,21 @@ class BlobDownloader:
                                     self._cfg.micro_backoff_max_s,
                                 )
                             )
+                            if rec == "restart-part":
+                                restart_whole_part = True
+                                break
+                            part_off = current - start
+                            f.flush()
+                            f.seek(part_off)
+                            f.truncate()
+                            written = part_off
+                            try:
+                                pbar.reset(total=total_chunk_size)
+                                pbar.update(part_off)
+                            except Exception:
+                                pbar.n = part_off
+                                pbar.last_print_n = part_off
+                                pbar.refresh()
                             continue
 
                         current += bytes_read
@@ -168,11 +193,14 @@ class BlobDownloader:
                                 self._cfg.jitter_inner_near_max_ms,
                             )
 
+                    if restart_whole_part:
+                        continue
+
                 self._controller.record_success()
                 return True
 
             except Exception as e:
-                print(f"[!] Chunk {idx} error: {e}")
+                print(f"[!] Part {idx} outer error: {e}")
                 self._controller.record_error()
                 backoff = min(2**attempt, 30)
                 time.sleep(backoff + random.uniform(0.5, 2.0))
@@ -184,7 +212,8 @@ class BlobDownloader:
         final_path = os.path.join(archive_dir, filename)
         parts_dir = final_path + ".parts"
         meta_path = final_path + ".meta.json"
-        url = f"{self._cfg.registry}/v2/{repo}/blobs/{digest}"
+        path_repo = encode_repo(repo)
+        url = f"{self._cfg.registry.rstrip('/')}/v2/{path_repo}/blobs/{digest}"
         chunk_sz = self._cfg.chunk_size
 
         mkdir(parts_dir)
@@ -204,17 +233,41 @@ class BlobDownloader:
         num_parts = math.ceil(total_size / chunk_sz) if total_size else 0
         print(f"[+] Adaptive download {digest} ({num_parts} parallel parts)")
 
+        def expected_part_bytes(i: int) -> int:
+            off = i * chunk_sz
+            return min(chunk_sz, max(0, total_size - off))
+
         completed: set[int] = set()
+        problematic_parts: set[int] = set()
         if os.path.exists(meta_path):
             try:
                 with open(meta_path) as f:
-                    saved = set(json.load(f).get("completed", []))
+                    meta = json.load(f)
+                saved = set(meta.get("completed", []))
+                problematic_parts = set(meta.get("problematic", []))
                 for i in saved:
                     part_path = os.path.join(parts_dir, f"part_{i}")
                     if os.path.exists(part_path):
                         completed.add(i)
             except Exception:
                 print("[!] Corrupted metadata → ignoring")
+
+        lock = threading.Lock()
+        digest_retry_round = 0
+
+        def _flush_meta_unlocked() -> None:
+            with open(meta_path, "w") as mf:
+                json.dump(
+                    {
+                        "completed": sorted(completed),
+                        "problematic": sorted(problematic_parts),
+                    },
+                    mf,
+                )
+
+        def persist_meta() -> None:
+            with lock:
+                _flush_meta_unlocked()
 
         with self._progress_lock:
             if self._global_progress is not None:
@@ -233,92 +286,195 @@ class BlobDownloader:
 
         downloaded_bytes = 0
         for i in completed:
-            start = i * chunk_sz
-            end = min(start + chunk_sz, total_size)
-            downloaded_bytes += end - start
+            downloaded_bytes += expected_part_bytes(i)
 
         if self._global_progress:
             self._global_progress.update(downloaded_bytes)
         self._refresh_global_postfix(digest, num_parts, len(completed))
 
-        lock = threading.Lock()
-        indices = list(range(num_parts))
-        random.shuffle(indices)
+        while True:
+            indices = list(range(num_parts))
+            random.shuffle(indices)
 
-        def worker(i: int) -> None:
-            if i in completed:
-                return
-            start = i * chunk_sz
-            end = min(start + chunk_sz - 1, total_size - 1)
-            part_path = os.path.join(parts_dir, f"part_{i}")
-            success = self.download_range(url, start, end, part_path, i, num_parts)
-            if success:
-                if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
-                    print(f"[!] Invalid part_{i}")
+            def worker(i: int) -> None:
+                if i in completed:
                     return
-                if not hash_file(part_path):
-                    print(f"[!] Hash failed chunk {i}")
-                    return
-                with lock:
-                    completed.add(i)
-                    with open(meta_path, "w") as f:
-                        json.dump({"completed": list(completed)}, f)
+                start = i * chunk_sz
+                end = min(start + chunk_sz - 1, total_size - 1)
+                part_path = os.path.join(parts_dir, f"part_{i}")
+
+                def mark_problematic() -> None:
+                    with lock:
+                        problematic_parts.add(i)
+                        _flush_meta_unlocked()
+
+                success = self.download_range(
+                    url,
+                    start,
+                    end,
+                    part_path,
+                    i,
+                    num_parts,
+                    on_subrange_error=mark_problematic,
+                )
+                if success:
+                    if not os.path.exists(part_path):
+                        print(f"[!] Missing part file {i}")
+                        return
+                    exp = expected_part_bytes(i)
+                    got = os.path.getsize(part_path)
+                    if got != exp:
+                        print(
+                            f"[!] Part {i} size {got} B != expected {exp} B — will re-download"
+                        )
+                        try:
+                            os.remove(part_path)
+                        except OSError:
+                            pass
+                        with lock:
+                            problematic_parts.add(i)
+                            completed.discard(i)
+                            _flush_meta_unlocked()
+                        return
+                    with lock:
+                        completed.add(i)
+                        _flush_meta_unlocked()
                     self._refresh_global_postfix(digest, num_parts, len(completed))
 
-            progress = len(completed) / num_parts if num_parts else 1.0
-            if progress > 0.8:
+                progress = len(completed) / num_parts if num_parts else 1.0
+                if progress > 0.8:
+                    self._jitter(
+                        self._cfg.jitter_worker_near_min_ms,
+                        self._cfg.jitter_worker_near_max_ms,
+                    )
+
+            while len(completed) < num_parts:
+                workers = self._controller.get_workers()
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    executor.map(worker, indices)
+                print(
+                    f"[i] Parts done: {len(completed)}/{num_parts} | workers={workers} | "
+                    f"throttle={self._controller.get_rate() / 1024 / 1024:.2f}MiB/s"
+                )
                 self._jitter(
-                    self._cfg.jitter_worker_near_min_ms,
-                    self._cfg.jitter_worker_near_max_ms,
+                    self._cfg.jitter_pool_loop_min_ms,
+                    self._cfg.jitter_pool_loop_max_ms,
                 )
 
-        while len(completed) < num_parts:
-            workers = self._controller.get_workers()
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                executor.map(worker, indices)
-            print(
-                f"[i] Parts done: {len(completed)}/{num_parts} | workers={workers} | "
-                f"throttle={self._controller.get_rate() / 1024 / 1024:.2f}MiB/s"
-            )
-            self._jitter(
-                self._cfg.jitter_pool_loop_min_ms,
-                self._cfg.jitter_pool_loop_max_ms,
-            )
+            print("[+] Verifying parts before merge...")
 
-        print("[+] Verifying parts before merge...")
-
-        missing: list[int] = []
-        for i in range(num_parts):
-            part_path = os.path.join(parts_dir, f"part_{i}")
-            if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
-                missing.append(i)
-
-        if missing:
-            print(f"[!] Missing parts detected ({len(missing)}) → full reset")
-            shutil.rmtree(parts_dir, ignore_errors=True)
-            if os.path.exists(meta_path):
-                os.remove(meta_path)
-            return self.parallel_download_blob(repo, digest, archive_dir)
-
-        print("[+] Merging parts...")
-        with open(final_path, "wb") as out:
+            missing: list[int] = []
             for i in range(num_parts):
-                with open(os.path.join(parts_dir, f"part_{i}"), "rb") as f:
-                    shutil.copyfileobj(f, out)
+                part_path = os.path.join(parts_dir, f"part_{i}")
+                if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
+                    missing.append(i)
 
-        if not verify_blob(final_path, digest):
-            print("[!] Final mismatch → reset")
-            if os.path.exists(parts_dir):
-                shutil.rmtree(parts_dir)
+            if missing:
+                print(
+                    f"[!] Missing parts {missing}: deleting {parts_dir!r} and meta.json; "
+                    f"restarting entire blob download from scratch for {digest}"
+                )
+                shutil.rmtree(parts_dir, ignore_errors=True)
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+                return self.parallel_download_blob(repo, digest, archive_dir)
+
+            wrong_sz: list[tuple[int, int, int]] = []
+            for i in range(num_parts):
+                pp = os.path.join(parts_dir, f"part_{i}")
+                exp = expected_part_bytes(i)
+                got = os.path.getsize(pp)
+                if got != exp:
+                    wrong_sz.append((i, got, exp))
+
+            if wrong_sz:
+                print(
+                    f"[!] Part size mismatch before merge: {wrong_sz[:8]}"
+                    f"{' ...' if len(wrong_sz) > 8 else ''} — scheduling re-download"
+                )
+                digest_retry_round += 1
+                for i, _, _ in wrong_sz:
+                    problematic_parts.add(i)
+                    completed.discard(i)
+                    pth = os.path.join(parts_dir, f"part_{i}")
+                    if os.path.exists(pth):
+                        os.remove(pth)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                persist_meta()
+                if digest_retry_round > self._cfg.digest_mismatch_max_rounds:
+                    print(
+                        "[!] Too many size-fix rounds → full reset (remove all parts + final)"
+                    )
+                    shutil.rmtree(parts_dir, ignore_errors=True)
+                    if os.path.exists(meta_path):
+                        os.remove(meta_path)
+                    if os.path.exists(final_path):
+                        os.remove(final_path)
+                    mkdir(parts_dir)
+                    return self.parallel_download_blob(repo, digest, archive_dir)
+                continue
+
+            print("[+] Merging parts...")
+            with open(final_path, "wb") as out:
+                for i in range(num_parts):
+                    with open(os.path.join(parts_dir, f"part_{i}"), "rb") as f:
+                        shutil.copyfileobj(f, out)
+
+            if verify_blob(final_path, digest):
+                with lock:
+                    problematic_parts.clear()
+                    _flush_meta_unlocked()
+                print(f"[✓] Completed: {digest}")
+                return final_path
+
+            digest_retry_round += 1
+            want_partial = (
+                self._cfg.digest_mismatch_recover == "retry-problematic"
+                and digest_retry_round <= self._cfg.digest_mismatch_max_rounds
+            )
+            if not want_partial:
+                print(
+                    f"[!] Merged blob failed digest verify (round {digest_retry_round}); "
+                    f"strategy={self._cfg.digest_mismatch_recover}. "
+                    f"Full reset: rm {parts_dir!r}, final artifact, meta.json"
+                )
+                if os.path.exists(parts_dir):
+                    shutil.rmtree(parts_dir)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                if os.path.exists(meta_path):
+                    os.remove(meta_path)
+                mkdir(parts_dir)
+                return self.parallel_download_blob(repo, digest, archive_dir)
+
+            targets = (
+                sorted(problematic_parts) if problematic_parts else list(range(num_parts))
+            )
+            print(
+                f"[!] Merged blob failed digest verify (retry round {digest_retry_round}/"
+                f"{self._cfg.digest_mismatch_max_rounds}). Re-downloading part index(es): "
+                f"{targets[:30]}{' ...' if len(targets) > 30 else ''}"
+            )
+            if problematic_parts:
+                print(
+                    f"    Flagged parts (subrange/transport or size issues): "
+                    f"{sorted(problematic_parts)}"
+                )
+            else:
+                print(
+                    "    No flagged parts — re-downloading all parts (needed for a consistent merge)."
+                )
+
+            for i in targets:
+                completed.discard(i)
+                pp = os.path.join(parts_dir, f"part_{i}")
+                if os.path.exists(pp):
+                    os.remove(pp)
+            problematic_parts.clear()
             if os.path.exists(final_path):
                 os.remove(final_path)
-            if os.path.exists(meta_path):
-                os.remove(meta_path)
-            mkdir(parts_dir)
-            return self.parallel_download_blob(repo, digest, archive_dir)
-
-        print(f"[✓] Completed: {digest}")
-        return final_path
+            persist_meta()
 
     def download_blob(self, repo: str, digest: str, archive_dir: str) -> str:
         filename = safe_digest(digest)

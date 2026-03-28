@@ -220,6 +220,18 @@ Sizes accept plain bytes (`5242880`) or suffixes: **`K`**, **`M`**, **`G`**, **`
 | `--stream-chunk` | `-s` | `8192` | `requests` `iter_content` read size (bytes). |
 | `--chunk-retries` | `-e` | `5` | Attempts per **part** file if the whole chunk download fails. |
 
+### Parallel download recovery (layers)
+
+When a ranged read fails mid-stream (e.g. **SSL `DECRYPTION_FAILED_OR_BAD_RECORD_MAC`**), the tool must not leave garbage bytes in the part file. It **truncates** back to the last good byte offset and retries that sub-range (default), or **`restart-part`** discards the whole part file and retries from scratch.
+
+| Long | Short | Default | Purpose |
+|------|-------|---------|---------|
+| `--subrange-recover` | — | `truncate` | `truncate` \| `restart-part` — see above. |
+| `--digest-mismatch` | — | `retry-problematic` | After merge, if the blob SHA-256 is wrong: `full` = delete all parts and restart; `retry-problematic` = re-fetch parts that had subrange/size problems first, or **all** parts if none were flagged. |
+| `--digest-mismatch-rounds` | — | `5` | Max **digest verify** retry passes for `retry-problematic` before falling back to a full part-tree reset (`0` = full reset on first bad digest). |
+
+`.meta.json` stores **`completed`** and **`problematic`** part indices so you can see which parts were flaky. Logs spell out **full reset** vs **partial re-download** and the reason.
+
 ### Simple blob download (config JSON)
 
 | Long | Short | Default | Purpose |
