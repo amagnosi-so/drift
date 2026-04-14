@@ -101,11 +101,7 @@ class DriftConfig:
     digest_mismatch_max_rounds: int
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Docker Registry Dumper + Rebuilder (robust, configurable)"
-    )
-
+def add_download_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-r",
         "--registry",
@@ -359,7 +355,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+
+def build_download_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Docker Registry Dumper + Rebuilder (robust, configurable)"
+    )
+    add_download_arguments(p)
     return p
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Backward-compatible alias for the registry download CLI parser."""
+    return build_download_parser()
 
 
 def config_from_args(ns: argparse.Namespace) -> DriftConfig:

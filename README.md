@@ -2,7 +2,7 @@
 
 **Drift: Docker Registry Image Fetching Tool**
 
-Dump images from a Docker Registry HTTP API (v2), extract layers to a filesystem tree, and optionally rebuild local images with `docker import`.
+Dump images from a Docker Registry HTTP API (v2), extract layers to a filesystem tree, and optionally rebuild local images with `docker import`. A separate **`deep-unpack`** command recursively unpacks nested ZIP and tar archives on disk (useful for exploring dumps or other archive trees).
 
 ## Requirements
 
@@ -46,10 +46,35 @@ pipx uninstall drift
 
 ## Usage
 
+The **`drift`** CLI is organized into **subcommands**:
+
+| Command | Purpose |
+|---------|---------|
+| **`download`** | Connect to a registry, plan, download blobs, extract layers (everything described in most of this README). |
+| **`deep-unpack`** | Walk a directory tree (or a single archive) and recursively extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` with safe path checks. |
+
+**Backward compatibility:** if the first argument is **not** a subcommand name, it is treated as **`download`**. Existing invocations such as `drift -r https://registry.example.com` still work. For clarity or scripts, you can write explicitly:
+
+```bash
+drift download -r https://registry.example.com
+```
+
+Top-level help lists the subcommands; per-command flags are on each subparser:
+
+```bash
+drift --help
+drift download --help
+drift deep-unpack --help
+```
+
+### `download` — registry dump
+
 Minimal example (TLS verify on, output under `./dump`):
 
 ```bash
 drift -r https://registry.example.com
+# equivalent:
+drift download -r https://registry.example.com
 ```
 
 ### Choosing repositories and tags
@@ -87,6 +112,22 @@ drift -r https://registry.example -S my/app -x
 ```
 
 **Note:** **`-i`** is used for **`--jitter-inline-min-ms`**; use **`-S`** / **`--image`** for repository selection.
+
+### `deep-unpack` — recursive archive extraction
+
+Scans **`path`** (default: current directory) for archives, extracts each into a sibling directory named `<stem>_unpacked` (with numeric suffixes if that name already exists), then repeats by **nesting depth**: inner archives found in those directories are processed in further passes, up to **`--depth`** levels (default **4**). Extraction uses path traversal checks; suspicious ZIP/TAR members are skipped with a warning.
+
+Parallel extraction uses **`--workers`** (default: `min(8, max(2, cpu_count))`). **`--verbose`** enables debug logging.
+
+Examples:
+
+```bash
+drift deep-unpack
+drift deep-unpack ./dump
+drift deep-unpack -d 6 -w 4 -v /path/to/archives
+```
+
+Flags on this subcommand are independent of **`download`** (for example, **`-d`** here is **nesting depth**, not jitter timing).
 
 ### Pre-download plan and confirmation
 
@@ -261,17 +302,19 @@ When a ranged read fails mid-stream (e.g. **SSL `DECRYPTION_FAILED_OR_BAD_RECORD
 | `--micro-backoff-min-s` | `-A` | `1` | Sub-request error backoff (seconds). |
 | `--micro-backoff-max-s` | `-C` | `3` | Sub-request error backoff (seconds). |
 
-For a one-line list of every flag, run:
+For a one-line list of every **registry download** flag, run:
 
 ```bash
-drift --help
+drift download --help
 ```
+
+(`drift --help` only summarizes subcommands.)
 
 ---
 
 ## Project layout
 
-- `driftpkg/` — library package (`BlobDownloader`, `DriftApp`, CLI parsing, etc.)
+- `driftpkg/` — library package (`BlobDownloader`, `DriftApp`, CLI, `deep_unpack`, etc.)
 - `drift.py` — thin script for running from a source tree without installing (`python drift.py …`)
 
 ## License
